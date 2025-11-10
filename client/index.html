@@ -1,0 +1,325 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Real-Time Canvas (Vanilla)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --panel:#fff; --border:#e5e7eb; --text:#111827; --muted:#6b7280; --accent:#4f46e5; --radius:12px; --shadow:0 8px 24px rgba(0,0,0,.08),0 2px 8px rgba(0,0,0,.06); }
+    html,body{height:100%;margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--text);background:#f6f7fb;}
+    body{touch-action:none;}
+    .app{display:grid;grid-template-columns:260px 1fr;height:100%;gap:16px;padding:16px;box-sizing:border-box;}
+    .sidebar{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:12px;display:flex;flex-direction:column;gap:12px;box-shadow:var(--shadow);}
+    .section h3{margin:6px 0;font-size:16px;}
+    .toolbar{display:flex;flex-direction:column;gap:8px;}
+    .toolbar label{font-size:12px;color:var(--muted);display:flex;justify-content:space-between;align-items:center;gap:8px;}
+    .toolbar input[type="color"]{width:44px;height:34px;border:1px solid var(--border);border-radius:10px;background:#fff;cursor:pointer;transition:transform .08s ease;}
+    .toolbar input[type="range"]{width:100%;accent-color:var(--accent);}
+    .btn{appearance:none;border:1px solid var(--border);background:#fff;padding:10px 12px;border-radius:12px;cursor:pointer;font-size:13px;transition:transform .08s ease, box-shadow .2s ease, border-color .2s ease, background .2s ease;box-shadow:0 1px 2px rgba(0,0,0,.04);width:100%;}
+    .btn:hover{box-shadow:0 4px 14px rgba(0,0,0,.08);}
+    .btn:active{transform:translateY(1px) scale(.99);}
+    .btn.primary{background:#eef2ff;border-color:#d9ddff;}
+    .btn.warn{background:#fff6f6;border-color:#ffd7d7;}
+    .users{flex:1;overflow:auto;border-top:1px dashed #e5e7eb;padding-top:8px;}
+    .user-row{display:flex;align-items:center;gap:8px;padding:4px 0;}
+    .dot{width:10px;height:10px;border-radius:50%;border:1px solid rgba(0,0,0,.08);}
+    .canvas-wrap{position:relative;background:#fff;border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden;}
+    canvas{display:block;width:100%;height:100%;background:#fff;touch-action:none;}
+    .cursor{position:absolute;pointer-events:none;transform:translate(-50%,-50%);font-size:12px;}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="sidebar">
+      <div class="section">
+        <h3>Tools</h3>
+        <div class="toolbar">
+          <label>Brush color <input id="color" type="color" value="#222222"></label>
+          <label>Stroke width <input id="width" type="range" min="1" max="30" value="4"></label>
+          <button id="brushBtn" class="btn primary">Brush</button>
+          <button id="eraserBtn" class="btn">Eraser</button>
+          <button id="undoBtn" class="btn">Undo (global)</button>
+          <button id="redoBtn" class="btn">Redo (global)</button>
+          <button id="clearLocalBtn" class="btn">Clear (local view)</button>
+          <button id="voteClearBtn" class="btn warn">Request Clear (vote)</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Users online</h3>
+        <div id="users" class="users"></div>
+        <div style="font-size:12px;color:#6b7280;">Tip: touch or mouse to draw. Undo/Redo applies per stroke.</div>
+      </div>
+    </div>
+
+    <div class="canvas-wrap" id="canvasWrap">
+      <canvas id="canvas"></canvas>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+  // ===== Canvas =====
+  const wrap = document.getElementById('canvasWrap');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const offscreen = document.createElement('canvas');
+  const octx = offscreen.getContext('2d');
+
+  function resize() {
+    const r = wrap.getBoundingClientRect();
+    canvas.width = r.width; canvas.height = r.height;
+    offscreen.width = r.width; offscreen.height = r.height;
+    fullReplay();
+  }
+  window.addEventListener('resize', resize);
+
+  // ===== State =====
+  const socket = io();
+  let myUser = null;
+  let brush = { mode: 'brush', color: '#222222', width: 4 };
+  let drawing = false;
+  let lastPointLocal = null;
+  let currentGroupId = null;
+
+  let opLog = [];
+  const lastSeg = new Map();    
+  const currBrush = new Map();  
+  let cursors = new Map();
+  let users = new Map();
+
+  // ===== UI =====
+  const colorInp = document.getElementById('color');
+  const widthInp = document.getElementById('width');
+  const brushBtn = document.getElementById('brushBtn');
+  const eraserBtn = document.getElementById('eraserBtn');
+  const undoBtn = document.getElementById('undoBtn');
+  const redoBtn = document.getElementById('redoBtn');
+  const clearLocalBtn = document.getElementById('clearLocalBtn');
+  const voteClearBtn = document.getElementById('voteClearBtn');
+  const usersDiv = document.getElementById('users');
+
+  colorInp.oninput = () => { brush.color = colorInp.value; };
+  widthInp.oninput = () => { brush.width = +widthInp.value; };
+  brushBtn.onclick = () => { brush.mode = 'brush'; brushBtn.classList.add('primary'); eraserBtn.classList.remove('primary'); };
+  eraserBtn.onclick = () => { brush.mode = 'eraser'; eraserBtn.classList.add('primary'); brushBtn.classList.remove('primary'); };
+  undoBtn.onclick = () => socket.emit('client:undo');
+  redoBtn.onclick = () => socket.emit('client:redo');
+  clearLocalBtn.onclick = () => { octx.clearRect(0,0,offscreen.width,offscreen.height); blit(); };
+  voteClearBtn.onclick = () => socket.emit('client:clear_all_request');
+
+  // ===== Draw helpers =====
+  function drawStrokePoint(g, p0, p1, width, color, mode) {
+    if (!p0 || !p1) return;
+    g.save();
+    if (mode === 'eraser') {
+      g.globalCompositeOperation = 'destination-out';
+      g.strokeStyle = 'rgba(0,0,0,1)';
+    } else {
+      g.globalCompositeOperation = 'source-over';
+      g.strokeStyle = color;
+    }
+    g.lineWidth = width;
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    g.beginPath(); g.moveTo(p0.x, p0.y); g.lineTo(p1.x, p1.y); g.stroke();
+    g.restore();
+  }
+
+  function blit() {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(offscreen, 0, 0);
+    drawRemoteCursors();
+  }
+
+  // ===== Pointer events (mouse + touch) =====
+  canvas.addEventListener('pointerdown', (e) => {
+    drawing = true;
+    lastPointLocal = pointerPos(e);
+    currentGroupId = cryptoRandomId();
+
+    socket.emit('client:op', {
+      kind: brush.mode === 'eraser' ? 'erase:start' : 'stroke:start',
+      data: { userId: myUser?.id, groupId: currentGroupId, brush: {...brush}, p: lastPointLocal }
+    });
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    const p = pointerPos(e);
+    throttleCursor(p);
+    if (!drawing) return;
+
+    drawStrokePoint(octx, lastPointLocal, p, brush.width, brush.color, brush.mode);
+    blit();
+
+    socket.emit('client:op', {
+      kind: brush.mode === 'eraser' ? 'erase:point' : 'stroke:point',
+      data: { userId: myUser?.id, groupId: currentGroupId, p }
+    });
+    lastPointLocal = p;
+  }, { passive: true });
+
+  window.addEventListener('pointerup', () => {
+    if (!drawing) return;
+    drawing = false;
+    socket.emit('client:op', {
+      kind: brush.mode === 'eraser' ? 'erase:end' : 'stroke:end',
+      data: { userId: myUser?.id, groupId: currentGroupId }
+    });
+    currentGroupId = null;
+  });
+
+  function pointerPos(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top, t: Date.now() };
+  }
+
+  // ===== Cursors =====
+  const cursorElems = new Map();
+  function drawRemoteCursors() {
+    for (const [uid, c] of cursors) {
+      let el = cursorElems.get(uid);
+      if (!el) {
+        el = document.createElement('div');
+        el.className = 'cursor';
+        el.textContent = '⬤';
+        wrap.appendChild(el);
+        cursorElems.set(uid, el);
+      }
+      el.style.left = `${c.x}px`;
+      el.style.top = `${c.y}px`;
+      el.style.color = users.get(uid)?.color || '#000';
+    }
+    for (const [uid, el] of cursorElems) {
+      if (!cursors.has(uid)) { el.remove(); cursorElems.delete(uid); }
+    }
+  }
+
+  let lastCursorSend = 0;
+  function throttleCursor(p) {
+    const now = performance.now();
+    if (now - lastCursorSend > 33) {
+      socket.emit('client:cursor', { x: p.x, y: p.y });
+      lastCursorSend = now;
+    }
+  }
+
+  // ===== Replay / Rendering =====
+  function applyOp(g, op) {
+    const d = op.data || {};
+    const uid = d.userId;
+    const k = op.kind;
+    if (!uid) return;
+
+    switch (k) {
+      case 'stroke:start':
+      case 'erase:start': {
+        lastSeg.set(uid, d.p);
+        const mode = k.startsWith('erase') ? 'eraser' : 'brush';
+        const b = d.brush || { color:'#222', width:4, mode };
+        currBrush.set(uid, { color: b.color, width: b.width, mode });
+        break;
+      }
+      case 'stroke:point':
+      case 'erase:point': {
+        const p0 = lastSeg.get(uid), p1 = d.p;
+        const b = currBrush.get(uid) || { color:'#222', width:4, mode: k.startsWith('erase')?'eraser':'brush' };
+        drawStrokePoint(g, p0, p1, b.width, b.color, b.mode);
+        lastSeg.set(uid, p1);
+        break;
+      }
+      case 'stroke:end':
+      case 'erase:end': {
+        lastSeg.delete(uid);
+        currBrush.delete(uid);
+        break;
+      }
+      case 'system:clear_all':
+        
+        break;
+      default: break;
+    }
+  }
+
+  function fullReplay() {
+    octx.clearRect(0,0,offscreen.width,offscreen.height);
+    lastSeg.clear(); currBrush.clear();
+    for (const op of opLog) if (!op.tombstone) applyOp(octx, op);
+    blit();
+  }
+
+  // ===== Presence =====
+  function renderUsers() {
+    usersDiv.innerHTML = '';
+    for (const u of users.values()) {
+      const row = document.createElement('div');
+      row.className = 'user-row';
+      const d = document.createElement('div'); d.className = 'dot'; d.style.background = u.color;
+      const name = document.createElement('div'); name.textContent = u.id.slice(0,4); // simple ID label
+      row.appendChild(d); row.appendChild(name);
+      usersDiv.appendChild(row);
+    }
+  }
+
+  // ===== Sockets =====
+  socket.on('server:snapshot', (snap) => {
+    opLog = snap.ops.map(o => ({ ...o }));
+    users.clear(); for (const u of snap.users) users.set(u.id, u);
+    myUser = users.get(socket.id);
+    if (myUser?.color) { colorInp.value = myUser.color; brush.color = myUser.color; }
+    renderUsers();
+    resize();
+  });
+
+  socket.on('server:op', (op) => {
+    opLog.push(op);
+    if (!op.tombstone && (op.kind.endsWith('start') || op.kind.endsWith('point') || op.kind.endsWith('end'))) {
+      applyOp(octx, op); blit();
+    } else {
+      fullReplay();
+    }
+  });
+
+  socket.on('server:undo_group', ({ groupId }) => {
+    for (const op of opLog) if (op.data?.groupId === groupId) op.tombstone = true;
+    fullReplay();
+  });
+
+  socket.on('server:redo_group', ({ groupId }) => {
+    for (const op of opLog) if (op.data?.groupId === groupId) op.tombstone = false;
+    fullReplay();
+  });
+
+  // Vote-to-clear UI
+  socket.on('server:clear_all_vote_started', ({ total, yesCount }) => {
+    voteClearBtn.textContent = `Vote in progress (${yesCount}/${total})`;
+    const yes = confirm('Clear whole canvas for everyone? Requires unanimous YES.');
+    socket.emit('client:clear_all_vote', { yes });
+  });
+
+  socket.on('server:clear_all_vote_progress', ({ total, yesCount }) => {
+    voteClearBtn.textContent = `Vote in progress (${yesCount}/${total})`;
+  });
+
+  socket.on('server:clear_all_applied', () => {
+    for (const op of opLog) op.tombstone = true;
+    fullReplay();
+    voteClearBtn.textContent = 'Request Clear (vote)';
+  });
+
+  socket.on('server:cursor', ({ userId, x, y }) => {
+    if (!users.has(userId)) return;
+    cursors.set(userId, { x, y });
+    drawRemoteCursors();
+  });
+
+  socket.on('server:user_joined', (u) => { users.set(u.id, u); renderUsers(); });
+  socket.on('server:user_left', ({ id }) => { users.delete(id); cursors.delete(id); renderUsers(); drawRemoteCursors(); });
+
+  // ===== utils =====
+  function cryptoRandomId() {
+    return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16));
+  }
+  </script>
+</body>
+</html>
