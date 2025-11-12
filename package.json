@@ -1,17 +1,14 @@
 {
-  "name": "realtime-canvas",
+  "name": "collaborative-canvas",
   "version": "1.0.0",
-  "description": "",
-  "main": "server.js",
+  "private": true,
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server/server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "express": "^5.1.0",
-    "socket.io": "^4.8.1"
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
   }
 }
